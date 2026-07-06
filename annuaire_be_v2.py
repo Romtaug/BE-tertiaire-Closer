@@ -159,11 +159,14 @@ def parse_fiche(html, url):
 def scrape(session, quals, scan_ids):
     print(f"== Scraping OPQIBI (quals {quals}) ==")
     fiches = set()
-    for q in quals:
-        fiches |= list_fiches_by_search(session, q)
-    if not fiches and scan_ids:
-        print("  Recherche vide -> fallback scan IDs")
+    if scan_ids:
+        # le scan brute force est PRIORITAIRE : la recherche par region du site
+        # ignore les parametres (elle renvoie une page par defaut)
+        print(f"  Mode scan IDs {scan_ids[0]}..{scan_ids[1]}")
         fiches = list_fiches_by_scan(session, scan_ids[0], scan_ids[1], quals)
+    else:
+        for q in quals:
+            fiches |= list_fiches_by_search(session, q)
     if not fiches:
         print("!! 0 fiche. Relance avec --scan-ids 1 9500")
         return pd.DataFrame()
@@ -406,8 +409,23 @@ def main():
             df[col] = ""
     if "departement" not in df.columns or df["departement"].eq("").all():
         df["departement"] = df["code_postal"].astype(str).str[:2]
+
+    # dedoublonnage SANS perdre les fiches au siret vide :
+    # url_fiche est toujours unique, puis dedup siret uniquement sur les siret valides
+    if "url_fiche" in df.columns:
+        df = df.drop_duplicates(subset=["url_fiche"])
     if "siret" in df.columns:
-        df = df.drop_duplicates(subset=["siret"])
+        ok = df["siret"].astype(str).str.len() == 14
+        df = pd.concat([df[ok].drop_duplicates(subset=["siret"]), df[~ok]],
+                       ignore_index=True)
+
+    # filtre post-parse : ne garder que les structures ayant une qualif visee
+    # (les fiches aux qualifs vides = parse incomplet, on les garde par securite)
+    pat = "|".join(re.escape(q) for q in args.quals)
+    quals_str = df["qualifications"].astype(str)
+    avant = len(df)
+    df = df[quals_str.str.contains(pat, na=False) | (quals_str.str.strip() == "")]
+    print(f"Filtre qualifs {args.quals} : {avant} -> {len(df)} structures")
 
     if not args.skip_enrich:
         df = enrich_sirene(session, df)
@@ -434,6 +452,8 @@ def main():
         "dep_69": int((df["departement"] == "69").sum()),
         "tiers": df["tier"].value_counts().to_dict(),
         "probatoires_1905": int((df["statut_1905"] == "probatoire").sum()),
+        "definitives_1905": int((df["statut_1905"] == "definitive").sum()),
+        "qualifs_vides": int((df["qualifications"].astype(str).str.strip() == "").sum()),
     }
     (out / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print("\n== RESULTATS ==")
