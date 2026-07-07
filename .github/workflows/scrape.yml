@@ -3,44 +3,36 @@ name: base-be-tertiaire
 on:
   workflow_dispatch:
     inputs:
-      quals:
-        description: "Codes qualification OPQIBI (separes par espaces)"
-        default: "1905"
-        required: true
-      scan_ids:
-        description: "Fallback scan IDs 'START END' (laisser vide sinon)"
+      dep:
+        description: "Departement a limiter (ex: 69). Vide = France entiere."
         default: ""
         required: false
       skip_enrich:
-        description: "true = sans enrichissement SIRENE/BODACC/sites"
+        description: "true = sans enrichissement SIRENE/BODACC/sites (plus rapide)"
         default: "false"
         required: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install deps
         run: pip install -r requirements.txt
-
       - name: Run pipeline
         run: |
-          ARGS="--quals ${{ github.event.inputs.quals }}"
-          if [ -n "${{ github.event.inputs.scan_ids }}" ]; then
-            ARGS="$ARGS --scan-ids ${{ github.event.inputs.scan_ids }}"
+          ARGS=""
+          if [ -n "${{ github.event.inputs.dep }}" ]; then
+            ARGS="$ARGS --dep ${{ github.event.inputs.dep }}"
           fi
           if [ "${{ github.event.inputs.skip_enrich }}" = "true" ]; then
             ARGS="$ARGS --skip-enrich"
           fi
           python annuaire_be_v2.py $ARGS
-
       - name: Upload resultats
         uses: actions/upload-artifact@v4
         with:
