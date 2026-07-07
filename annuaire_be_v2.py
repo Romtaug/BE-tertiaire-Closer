@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-annuaire_be_v2.py - Base de prospection NATIONALE des bureaux d'etudes energie
+annuaire_be_v4.py - Base de prospection NATIONALE des bureaux d'etudes energie
 Source principale : OPEN DATA RGE ADEME (API DataFair, licence ouverte, France entiere)
 Sortie : base_be_tertiaire.xlsx (style, multi-onglets) + CSV + run_summary.json
 
+Pourquoi l'ADEME et plus le scraping OPQIBI :
+  - couverture nationale native (fini le bug region)
+  - email + telephone + site deja dans la donnee
+  - champ meta_domaine structure (fini le bug d'extraction des qualifs)
+  - ~1 min via API au lieu de 2h de scan
+  - Licence Ouverte Etalab : revente commerciale autorisee
+
 Pipeline :
-  1. PULL ADEME : lignes meta_domaine="Etudes energetiques" (exclusion Architecte),
-     regroupement par entreprise, dedup SIRET.
-  2. ENRICHISSEMENT gratuit (sans cle) : SIRENE (etat/effectif/dirigeant),
-     BODACC (procedures collectives), sites web (email manquant).
-  3. SCORING + tiers (CHAUD / TIEDE / A QUALIFIER / HORS CIBLE / EN DIFFICULTE / FERMEE).
+  1. PULL ADEME : toutes les lignes meta_domaine="Etudes energetiques"
+     (exclusion Architecte + domaines travaux/installations), dedup SIRET.
+  2. ENRICHISSEMENT gratuit (sans cle) :
+     - recherche-entreprises.api.gouv.fr : etat admin + effectif + dirigeant
+     - BODACC opendatasoft : procedures collectives
+     - sites web : email pour les fiches sans email
+  3. SCORING + tiers (CHAUD / TIEDE / A QUALIFIER / HORS CIBLE / EN DIFFICULTE / FERMEE)
+     avec bonus "domaine tertiaire" (logement collectif, enveloppe, systeme technique...).
   4. EXPORTS.
 
 Usage :
   pip install requests beautifulsoup4 pandas openpyxl
-  python annuaire_be_v2.py                # national complet
-  python annuaire_be_v2.py --dep 69       # un departement
-  python annuaire_be_v2.py --skip-enrich  # sans SIRENE/BODACC/sites (rapide)
-  python annuaire_be_v2.py --from-csv base.csv
+  python annuaire_be_v4.py                     # national complet
+  python annuaire_be_v4.py --dep 69            # un departement
+  python annuaire_be_v4.py --skip-enrich       # sans SIRENE/BODACC/sites (rapide)
+  python annuaire_be_v4.py --from-csv base.csv # reprendre un CSV, sauter le pull
 """
 
 import argparse
@@ -34,12 +44,14 @@ import requests
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; base-be-tertiaire/4.0; usage pro)"}
 DEPS_AURA = {"01", "03", "07", "15", "26", "38", "42", "43", "63", "69", "73", "74"}
+
 ADEME_LINES = "https://data.ademe.fr/data-fair/api/v1/datasets/liste-des-entreprises-rge-2/lines"
 
 TIER_HOT, TIER_WARM, TIER_QUAL = "CHAUD", "TIEDE", "A QUALIFIER"
 TIER_OUT, TIER_DIFF, TIER_DEAD = "HORS CIBLE", "EN DIFFICULTE", "FERMEE"
 TIER_ORDER = [TIER_HOT, TIER_WARM, TIER_QUAL, TIER_OUT, TIER_DIFF, TIER_DEAD]
 
+# domaines d'etudes les plus pertinents pour le decret tertiaire (bonus scoring)
 TERTIAIRE_KW = ["logement collectif", "tertiaire", "enveloppe", "systeme technique",
                 "thermique reglementaire", "eclairage", "acv", "commiss", "photovolt"]
 
@@ -53,28 +65,62 @@ def domaine_tertiaire(dom):
     n = norm(dom)
     return any(k in n for k in TERTIAIRE_KW)
 
+# ================================================================ PULL ADEME
 
 def pull_ademe(session, dep=None):
-    print("== Pull open data RGE ADEME ==")
-    rows, url, params = [], ADEME_LINES, {"size": 10000}
-    page = 0
-    while url:
+    """Recupere les lignes RGE 'Etudes energetiques' via l'API DataFair.
+
+    Pagination explicite page/size (plus fiable que le curseur 'next'),
+    filtre serveur meta_domaine, flush des logs, garde-fous anti-boucle.
+    """
+    print("== Pull open data RGE ADEME ==", flush=True)
+    size = 5000
+    rows, page, err_streak = [], 1, 0
+    base_params = {
+        "size": size,
+        "sort": "siret",
+        "select": "nom_entreprise,siret,adresse,code_postal,commune,"
+                  "telephone,email,site_internet,domaine,meta_domaine,organisme",
+        "qs": 'meta_domaine:"Etudes énergétiques"',
+    }
+    if dep:
+        base_params["code_postal"] = f"{dep}*"
+
+    while True:
+        params = dict(base_params, page=page)
         try:
-            r = session.get(url, params=params, headers=HEADERS, timeout=90)
+            r = session.get(ADEME_LINES, params=params, headers=HEADERS, timeout=90)
+            if r.status_code == 400 and ("qs" in base_params or "select" in base_params):
+                print("  (param non supporte -> filtre client)", flush=True)
+                base_params.pop("qs", None)
+                base_params.pop("select", None)
+                continue
             r.raise_for_status()
         except requests.RequestException as e:
-            print(f"  ADEME erreur page {page + 1} : {e}")
+            print(f"  ADEME erreur page {page} : {e}", flush=True)
+            err_streak += 1
+            if err_streak >= 3:
+                print("  3 erreurs consecutives, arret.", flush=True)
+                break
             time.sleep(3)
             continue
+        err_streak = 0
+
         data = r.json()
-        results = data.get("results", [])
+        results = data.get("results", data if isinstance(data, list) else [])
+        total = data.get("total") if isinstance(data, dict) else None
         rows.extend(results)
-        page += 1
-        print(f"  page {page} : +{len(results)} (total brut {len(rows)})")
-        url = data.get("next")
-        params = None
+        print(f"  page {page} : +{len(results)} (total {len(rows)}"
+              + (f" / {total}" if total else "") + ")", flush=True)
+
         if not results:
             break
+        if total and len(rows) >= total:
+            break
+        if page >= 200:
+            print("  garde-fou 200 pages, arret.", flush=True)
+            break
+        page += 1
         time.sleep(0.15)
 
     df = pd.DataFrame(rows)
@@ -83,6 +129,7 @@ def pull_ademe(session, dep=None):
         return df
     print(f"  brut : {len(df)} labels, colonnes : {list(df.columns)[:12]}...")
 
+    # normaliser les noms de colonnes attendus (tolerant aux variations)
     ren = {}
     for c in df.columns:
         cl = c.lower()
@@ -95,11 +142,13 @@ def pull_ademe(session, dep=None):
         if need not in df.columns:
             df[need] = ""
 
+    # filtre etudes energetiques + exclusion architecte
     md = df["meta_domaine"].map(norm)
     dom = df["domaine"].map(norm)
     df = df[(md == "etudes energetiques") & (dom != "architecte")].copy()
     print(f"  filtre 'Etudes energetiques' (excl. archi) : {len(df)} labels")
 
+    # regrouper les domaines par entreprise (une entreprise = plusieurs labels)
     df["siret"] = df["siret"].astype(str).str.replace(r"\D", "", regex=True).str[:14]
     df["siren"] = df["siret"].str[:9]
     agg = {c: "first" for c in ["nom", "email", "telephone", "site", "adresse",
@@ -117,6 +166,7 @@ def pull_ademe(session, dep=None):
     print(f"  entreprises uniques (dedup SIRET) : {len(base)}")
     return base
 
+# ================================================================ ENRICHISSEMENT
 
 def enrich_sirene(session, df):
     print("== Enrichissement SIRENE (etat, effectif, dirigeant) ==")
@@ -209,14 +259,17 @@ def enrich_emails_sites(session, df):
                 time.sleep(0.25)
     return df
 
+# ================================================================ SCORING
 
-EFF_MAP = {"NN": 0, "00": 0, "01": 2, "02": 5, "03": 9, "11": 19, "12": 49,
-           "21": 99, "22": 199, "31": 249, "32": 499, "41": 999, "42": 1999,
-           "51": 4999, "52": 9999, "53": 10000}
+EFF_MAP = {  # codes tranche effectif INSEE -> borne haute approx
+    "NN": 0, "00": 0, "01": 2, "02": 5, "03": 9, "11": 19, "12": 49,
+    "21": 99, "22": 199, "31": 249, "32": 499, "41": 999, "42": 1999,
+    "51": 4999, "52": 9999, "53": 10000,
+}
 
 
 def score_row(r):
-    pts, why = 3, ["RGE etudes"]
+    pts, why = 3, ["RGE etudes"]  # deja filtre etudes energetiques
     if "@" in str(r.get("email", "")):
         pts += 2; why.append("email")
     if len(str(r.get("telephone", ""))) > 5:
@@ -244,6 +297,7 @@ def tier_row(r):
         return TIER_WARM
     return TIER_QUAL
 
+# ================================================================ EXCEL
 
 def build_excel(df, path):
     from openpyxl import Workbook
@@ -312,6 +366,7 @@ def build_excel(df, path):
     wb.calculation.fullCalcOnLoad = True
     wb.save(path)
 
+# ================================================================ MAIN
 
 def main():
     ap = argparse.ArgumentParser()
