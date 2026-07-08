@@ -12,6 +12,9 @@ on:
         default: "false"
         required: false
 
+permissions:
+  contents: write
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -33,7 +36,25 @@ jobs:
             ARGS="$ARGS --skip-enrich"
           fi
           python annuaire_be_v2.py $ARGS
-      - name: Upload resultats
+
+      - name: Ranger les resultats dans data/
+        run: |
+          mkdir -p data
+          cp -f base_be_tertiaire.xlsx data/ 2>/dev/null || true
+          cp -f base_be_max_national.csv data/ 2>/dev/null || true
+          cp -f base_be_max_aura.csv data/ 2>/dev/null || true
+          cp -f base_be_max_69.csv data/ 2>/dev/null || true
+          cp -f run_summary.json data/ 2>/dev/null || true
+
+      - name: Commit des resultats dans le repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "MAJ base BE tertiaire (run #${{ github.run_number }})" || echo "rien a committer"
+          git push || echo "push echoue (verifier permissions)"
+
+      - name: Upload resultats (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: base-be-tertiaire-${{ github.run_number }}
