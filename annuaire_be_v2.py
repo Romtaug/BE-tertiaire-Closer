@@ -70,34 +70,34 @@ def domaine_tertiaire(dom):
 def pull_ademe(session, dep=None):
     """Recupere les lignes RGE 'Etudes energetiques' via l'API DataFair.
 
-    Pagination explicite page/size (plus fiable que le curseur 'next'),
-    filtre serveur meta_domaine, flush des logs, garde-fous anti-boucle.
+    Pagination par CURSEUR 'next' (natif DataFair, pas de limite 10k comme page/size).
+    Filtre meta_domaine tente cote serveur (qs) ET re-applique cote client par securite.
     """
     print("== Pull open data RGE ADEME ==", flush=True)
-    size = 5000
-    rows, page, err_streak = [], 1, 0
-    base_params = {
-        "size": size,
-        "sort": "siret",
+    params = {
+        "size": 5000,
         "select": "nom_entreprise,siret,adresse,code_postal,commune,"
                   "telephone,email,site_internet,domaine,meta_domaine,organisme",
-        "qs": 'meta_domaine:"Etudes énergétiques"',
+        "qs": 'meta_domaine:"Etudes\\ energetiques"',
     }
     if dep:
-        base_params["code_postal"] = f"{dep}*"
+        params["qs"] = f'({params["qs"]}) AND code_postal:{dep}*'
 
-    while True:
-        params = dict(base_params, page=page)
+    rows, url, err_streak, page = [], ADEME_LINES, 0, 0
+    first = True
+    while url:
         try:
-            r = session.get(ADEME_LINES, params=params, headers=HEADERS, timeout=90)
-            if r.status_code == 400 and ("qs" in base_params or "select" in base_params):
-                print("  (param non supporte -> filtre client)", flush=True)
-                base_params.pop("qs", None)
-                base_params.pop("select", None)
+            r = session.get(url, params=params if first else None,
+                            headers=HEADERS, timeout=90)
+            if r.status_code == 400 and ("qs" in params or "select" in params):
+                print("  (param non supporte -> pull sans filtre serveur, filtre client)", flush=True)
+                params.pop("qs", None); params.pop("select", None)
+                url, first = ADEME_LINES, True
+                rows = []
                 continue
             r.raise_for_status()
         except requests.RequestException as e:
-            print(f"  ADEME erreur page {page} : {e}", flush=True)
+            print(f"  ADEME erreur : {e}", flush=True)
             err_streak += 1
             if err_streak >= 3:
                 print("  3 erreurs consecutives, arret.", flush=True)
@@ -105,22 +105,18 @@ def pull_ademe(session, dep=None):
             time.sleep(3)
             continue
         err_streak = 0
+        first = False
 
         data = r.json()
-        results = data.get("results", data if isinstance(data, list) else [])
-        total = data.get("total") if isinstance(data, dict) else None
+        results = data.get("results", [])
         rows.extend(results)
+        page += 1
+        total = data.get("total")
         print(f"  page {page} : +{len(results)} (total {len(rows)}"
               + (f" / {total}" if total else "") + ")", flush=True)
-
-        if not results:
+        url = data.get("next")   # curseur natif DataFair : URL complete de la suite
+        if not results or page >= 400:
             break
-        if total and len(rows) >= total:
-            break
-        if page >= 200:
-            print("  garde-fou 200 pages, arret.", flush=True)
-            break
-        page += 1
         time.sleep(0.15)
 
     df = pd.DataFrame(rows)
