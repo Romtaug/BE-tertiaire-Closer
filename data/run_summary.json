@@ -1,0 +1,15 @@
+{
+  "total": 284,
+  "avec_email": 260,
+  "avec_tel": 222,
+  "aura": 284,
+  "dep_69": 284,
+  "tiers": {
+    "CHAUD": 169,
+    "TIEDE": 63,
+    "HORS CIBLE": 36,
+    "A QUALIFIER": 7,
+    "EN DIFFICULTE": 6,
+    "FERMEE": 3
+  }
+}
