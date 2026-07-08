@@ -232,31 +232,40 @@ BAD_MAIL = ("example", "wixpress", "sentry", "@2x", ".png", ".jpg", "@sentry")
 
 
 def enrich_emails_sites(session, df):
-    print("== Enrichissement emails via sites web ==")
+    print("== Enrichissement emails via sites web ==", flush=True)
     if "email_source" not in df.columns:
         df["email_source"] = ""
     todo = df[(~df["email"].astype(str).str.contains("@")) & (df["site"].astype(str).str.len() > 3)]
-    print(f"  {len(todo)} fiches sans email mais avec site")
+    print(f"  {len(todo)} fiches sans email mais avec site", flush=True)
+    done = 0
     for idx, row in todo.iterrows():
-        site = str(row["site"]).strip()
-        if not site.startswith("http"):
-            site = "https://" + site
-        for path in ("", "/contact", "/mentions-legales"):
-            try:
-                r = session.get(site.rstrip("/") + path, headers=HEADERS, timeout=10)
-                if r.status_code != 200:
-                    continue
-                for mail in EMAIL_RE.findall(r.text):
-                    if not any(b in mail.lower() for b in BAD_MAIL):
-                        df.at[idx, "email"] = mail
-                        df.at[idx, "email_source"] = "site_web"
+        done += 1
+        try:
+            site = str(row["site"]).strip()
+            if not site.startswith("http"):
+                site = "https://" + site
+            for path in ("", "/contact", "/mentions-legales"):
+                try:
+                    r = session.get(site.rstrip("/") + path, headers=HEADERS,
+                                    timeout=8, allow_redirects=True)
+                    if r.status_code != 200 or not r.headers.get("content-type", "").startswith(("text", "application/xhtml")):
+                        continue
+                    html = r.text[:500000]  # cap anti-page-geante
+                    for mail in EMAIL_RE.findall(html):
+                        if not any(b in mail.lower() for b in BAD_MAIL):
+                            df.at[idx, "email"] = mail
+                            df.at[idx, "email_source"] = "site_web"
+                            break
+                    if "@" in str(df.at[idx, "email"]):
                         break
-                if "@" in str(df.at[idx, "email"]):
-                    break
-            except requests.RequestException:
-                continue
-            finally:
-                time.sleep(0.25)
+                except Exception:
+                    continue
+                finally:
+                    time.sleep(0.2)
+        except Exception:
+            continue  # aucune fiche ne peut faire planter l'etape
+        if done % 100 == 0:
+            print(f"  {done}/{len(todo)}", flush=True)
     return df
 
 # ================================================================ SCORING
@@ -391,10 +400,22 @@ def main():
             df[col] = ""
     df["departement"] = df["code_postal"].astype(str).str[:2]
 
+    out = Path(".")
     if not args.skip_enrich:
         df = enrich_sirene(session, df)
         df = enrich_bodacc(session, df)
-        df = enrich_emails_sites(session, df)
+        # sauvegarde de secours AVANT le scraping des sites (etape la plus fragile) :
+        # si un site fait planter, on garde deja la base enrichie SIRENE + BODACC.
+        try:
+            df.to_csv(out / "base_be_max_national.csv", index=False, quoting=csv.QUOTE_MINIMAL)
+            print("  [secours] base intermediaire sauvegardee (avant emails sites)", flush=True)
+        except Exception as e:
+            print(f"  [secours] echec sauvegarde intermediaire : {e}", flush=True)
+        # l'enrichissement emails ne doit JAMAIS faire planter le run
+        try:
+            df = enrich_emails_sites(session, df)
+        except Exception as e:
+            print(f"  enrichissement emails interrompu ({e}), on continue sans.", flush=True)
 
     sc = df.apply(score_row, axis=1, result_type="expand")
     df["score"], df["score_detail"], df["effectif_num"] = sc[0], sc[1], sc[2]
@@ -402,7 +423,6 @@ def main():
     df["rk"] = df["tier"].map({t: i for i, t in enumerate(TIER_ORDER)})
     df = df.sort_values(["rk", "score"], ascending=[True, False]).drop(columns="rk")
 
-    out = Path(".")
     build_excel(df, out / "base_be_tertiaire.xlsx")
     df.to_csv(out / "base_be_max_national.csv", index=False, quoting=csv.QUOTE_MINIMAL)
     df[df["departement"].isin(DEPS_AURA)].to_csv(out / "base_be_max_aura.csv", index=False)
